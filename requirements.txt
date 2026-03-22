@@ -1,0 +1,5 @@
+# Python >=3.12 (Ubuntu 24.04 LTS default)
+Django>=4.2
+djangorestframework>=3.14
+django-apscheduler>=0.6
+requests>=2.28
