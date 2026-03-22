@@ -147,11 +147,20 @@ class APICredentialModelTest(TestCase):
         self.assertEqual(kwargs['params']['api_key'], 'key123')
 
     def test_build_request_kwargs_basic(self):
+        from requests.auth import HTTPBasicAuth
         cred = make_credential(
             self.endpoint, auth_type='basic', username='user', password='pass',
         )
         kwargs = cred.build_request_kwargs({})
-        self.assertEqual(kwargs['auth'], ('user', 'pass'))
+        self.assertIsInstance(kwargs['auth'], HTTPBasicAuth)
+
+    def test_build_request_kwargs_digest(self):
+        from requests.auth import HTTPDigestAuth
+        cred = make_credential(
+            self.endpoint, auth_type='digest', username='user', password='pass',
+        )
+        kwargs = cred.build_request_kwargs({})
+        self.assertIsInstance(kwargs['auth'], HTTPDigestAuth)
 
     def test_build_request_kwargs_custom_header(self):
         cred = make_credential(
@@ -167,11 +176,69 @@ class APICredentialModelTest(TestCase):
         self.assertEqual(kwargs['headers'].get('X-Existing'), 'yes')
         self.assertNotIn('Authorization', kwargs['headers'])
 
-    def test_extra_headers_preserved(self):
+    def test_build_request_kwargs_with_extra_headers(self):
+        """extra_headers are merged regardless of auth_type."""
+        cred = make_credential(
+            self.endpoint, auth_type='bearer', token='tok',
+            extra_headers={'X-Tenant-ID': 'acme', 'X-Version': '2'},
+        )
+        kwargs = cred.build_request_kwargs({})
+        self.assertIn('Authorization', kwargs['headers'])
+        self.assertEqual(kwargs['headers']['X-Tenant-ID'], 'acme')
+        self.assertEqual(kwargs['headers']['X-Version'], '2')
+
+    def test_build_request_kwargs_with_extra_query_params(self):
+        """extra_query_params are merged regardless of auth_type."""
+        cred = make_credential(
+            self.endpoint, auth_type='api_key_query',
+            token='k', query_param_name='api_key',
+            extra_query_params={'version': '3', 'format': 'json'},
+        )
+        kwargs = cred.build_request_kwargs({})
+        self.assertEqual(kwargs['params']['api_key'], 'k')
+        self.assertEqual(kwargs['params']['version'], '3')
+        self.assertEqual(kwargs['params']['format'], 'json')
+
+    def test_build_request_kwargs_extra_only_no_primary_auth(self):
+        """extra_headers/extra_query_params work with auth_type='none'."""
+        cred = make_credential(
+            self.endpoint, auth_type='none',
+            extra_headers={'X-API-Key': 'abc', 'X-Client-ID': 'xyz'},
+            extra_query_params={'tenant': 'demo'},
+        )
+        kwargs = cred.build_request_kwargs({})
+        self.assertEqual(kwargs['headers']['X-API-Key'], 'abc')
+        self.assertEqual(kwargs['headers']['X-Client-ID'], 'xyz')
+        self.assertEqual(kwargs['params']['tenant'], 'demo')
+        self.assertNotIn('Authorization', kwargs['headers'])
+
+    def test_endpoint_headers_preserved(self):
         cred = make_credential(self.endpoint, auth_type='bearer', token='tok')
         kwargs = cred.build_request_kwargs({'Accept': 'application/json'})
         self.assertEqual(kwargs['headers']['Accept'], 'application/json')
         self.assertIn('Authorization', kwargs['headers'])
+
+    @patch('api.models.APICredential._fetch_oauth2_token', return_value='oauth-tok')
+    def test_build_request_kwargs_oauth2(self, mock_fetch):
+        cred = make_credential(
+            self.endpoint, auth_type='oauth2_client_credentials',
+            client_id='cid', client_secret='csec',
+            token_url='https://auth.example.com/token',
+        )
+        kwargs = cred.build_request_kwargs({})
+        mock_fetch.assert_called_once()
+        self.assertEqual(kwargs['headers']['Authorization'], 'Bearer oauth-tok')
+
+    @patch('api.models.APICredential._fetch_oauth2_token',
+           side_effect=ValueError('OAuth 2.0 token fetch failed'))
+    def test_build_request_kwargs_oauth2_error_propagates(self, mock_fetch):
+        cred = make_credential(
+            self.endpoint, auth_type='oauth2_client_credentials',
+            client_id='cid', client_secret='csec',
+            token_url='https://auth.example.com/token',
+        )
+        with self.assertRaises(ValueError):
+            cred.build_request_kwargs({})
 
 
 
@@ -293,7 +360,51 @@ class APIEndpointAPITest(TestCase):
         headers = call_kwargs.kwargs.get('headers', call_kwargs[1].get('headers', {}))
         self.assertEqual(headers.get('Authorization'), 'Bearer my-bearer')
 
+    def test_create_endpoint_with_oauth2_credential(self):
+        data = {
+            'name': 'OAuth API',
+            'url': 'https://api.example.com/data',
+            'method': 'GET',
+            'credential': {
+                'auth_type': 'oauth2_client_credentials',
+                'client_id': 'my-client',
+                'client_secret': 'my-secret',
+                'token_url': 'https://auth.example.com/token',
+                'oauth2_scope': 'read write',
+            },
+        }
+        response = self.client.post(self._list_url(), data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        ep = APIEndpoint.objects.get(pk=response.data['id'])
+        self.assertEqual(ep.credential.auth_type, 'oauth2_client_credentials')
+        self.assertEqual(ep.credential.client_id, 'my-client')
+        self.assertEqual(ep.credential.client_secret, 'my-secret')
+        self.assertEqual(ep.credential.oauth2_scope, 'read write')
+        # client_secret must not be returned in the response
+        self.assertNotIn('client_secret', response.data['credential'])
 
+    def test_create_endpoint_with_extra_headers_overlay(self):
+        data = {
+            'name': 'Multi-Header API',
+            'url': 'https://api.example.com/data',
+            'method': 'GET',
+            'credential': {
+                'auth_type': 'bearer',
+                'token': 'tok',
+                'extra_headers': {'X-Tenant-ID': 'acme', 'X-Version': '2'},
+                'extra_query_params': {'format': 'json'},
+            },
+        }
+        response = self.client.post(self._list_url(), data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        ep = APIEndpoint.objects.get(pk=response.data['id'])
+        self.assertEqual(ep.credential.extra_headers['X-Tenant-ID'], 'acme')
+        self.assertEqual(ep.credential.extra_query_params['format'], 'json')
+
+
+# ---------------------------------------------------------------------------
+# ScheduledTask API tests
+# ---------------------------------------------------------------------------
 
 class ScheduledTaskAPITest(TestCase):
     def setUp(self):

@@ -6,8 +6,8 @@ from .models import APICredential, APIEndpoint, APIResult, ScheduledTask
 class APICredentialSerializer(serializers.ModelSerializer):
     """Credential data nested inside APIEndpointSerializer.
 
-    Sensitive fields (token, password) are write-only so they are never
-    returned in API responses.
+    Sensitive fields (token, password, client_secret) are write-only so
+    they are never returned in API responses.
     """
 
     token = serializers.CharField(
@@ -18,16 +18,30 @@ class APICredentialSerializer(serializers.ModelSerializer):
         max_length=500, write_only=True, required=False, allow_blank=True,
         style={'input_type': 'password'},
     )
+    client_secret = serializers.CharField(
+        max_length=2000, write_only=True, required=False, allow_blank=True,
+        style={'input_type': 'password'},
+    )
 
     class Meta:
         model = APICredential
         fields = [
             'auth_type',
+            # Token / API key / custom header
             'token',
-            'username',
-            'password',
             'header_name',
             'query_param_name',
+            # Basic / Digest
+            'username',
+            'password',
+            # OAuth 2.0 Client Credentials
+            'client_id',
+            'client_secret',
+            'token_url',
+            'oauth2_scope',
+            # Always-applied overlays
+            'extra_headers',
+            'extra_query_params',
         ]
 
 

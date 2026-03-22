@@ -21,6 +21,8 @@ AUTH_TYPE_CHOICES = [
     ('api_key_header', 'API Key – Header'),
     ('api_key_query', 'API Key – Query Parameter'),
     ('basic', 'Basic Auth (Username & Password)'),
+    ('digest', 'Digest Auth (Username & Password)'),
+    ('oauth2_client_credentials', 'OAuth 2.0 – Client Credentials'),
     ('custom_header', 'Custom Header'),
 ]
 
@@ -54,26 +56,34 @@ class APICredential(models.Model):
 
     One-to-one with APIEndpoint so every endpoint has its own isolated
     credential configuration that can be updated independently.
+
+    Primary auth is controlled by ``auth_type``.  In addition,
+    ``extra_headers`` and ``extra_query_params`` are always merged into
+    every request, regardless of the primary auth type, allowing arbitrary
+    multi-header / multi-param configurations.
     """
 
     endpoint = models.OneToOneField(
         APIEndpoint, on_delete=models.CASCADE, related_name='credential'
     )
     auth_type = models.CharField(
-        max_length=20, choices=AUTH_TYPE_CHOICES, default='none',
-        help_text='Authentication method used when calling this endpoint',
+        max_length=30, choices=AUTH_TYPE_CHOICES, default='none',
+        help_text='Primary authentication method used when calling this endpoint',
     )
-    # Token / API key value / custom header value
+
+    # ---- Token / API key / custom header value ---------------------------
     token = models.CharField(
         max_length=2000, blank=True,
         help_text='Bearer token, API key value, or custom header value',
     )
-    # Basic auth
+
+    # ---- Basic / Digest auth ---------------------------------------------
     username = models.CharField(max_length=500, blank=True,
-                                help_text='Username for Basic Auth')
+                                help_text='Username for Basic or Digest Auth')
     password = models.CharField(max_length=500, blank=True,
-                                help_text='Password for Basic Auth')
-    # Header / query-param name used for API key and custom-header auth
+                                help_text='Password for Basic or Digest Auth')
+
+    # ---- Header / query-param names --------------------------------------
     header_name = models.CharField(
         max_length=200, blank=True, default='Authorization',
         help_text='Header name for "API Key – Header" or "Custom Header" auth '
@@ -83,6 +93,45 @@ class APICredential(models.Model):
         max_length=200, blank=True,
         help_text='Query parameter name for "API Key – Query Parameter" auth',
     )
+
+    # ---- OAuth 2.0 Client Credentials ------------------------------------
+    client_id = models.CharField(
+        max_length=500, blank=True,
+        help_text='OAuth 2.0 client ID',
+    )
+    client_secret = models.CharField(
+        max_length=2000, blank=True,
+        help_text='OAuth 2.0 client secret',
+    )
+    token_url = models.URLField(
+        max_length=2000, blank=True,
+        help_text='OAuth 2.0 token endpoint URL '
+                  '(e.g. https://auth.example.com/oauth/token)',
+    )
+    oauth2_scope = models.CharField(
+        max_length=500, blank=True,
+        help_text='Optional space-separated OAuth 2.0 scopes',
+    )
+
+    # ---- Always-applied overlays -----------------------------------------
+    extra_headers = models.JSONField(
+        default=dict, blank=True,
+        help_text=(
+            'Additional HTTP headers applied on every request, merged after '
+            'the primary auth headers.  Use for multi-header API keys, tenant '
+            'IDs, versioning headers, etc.  '
+            'Example: {"X-Tenant-ID": "acme", "X-API-Version": "2"}'
+        ),
+    )
+    extra_query_params = models.JSONField(
+        default=dict, blank=True,
+        help_text=(
+            'Additional query parameters applied on every request, merged '
+            'after any primary auth query params.  '
+            'Example: {"version": "2", "format": "json"}'
+        ),
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -96,17 +145,46 @@ class APICredential(models.Model):
     # Apply credentials to a pending requests.request call
     # ------------------------------------------------------------------
 
-    def build_request_kwargs(self, extra_headers: dict) -> dict:
-        """Return a dict of kwargs to merge into ``requests.request()``.
+    def _fetch_oauth2_token(self) -> str:
+        """Exchange client credentials for an OAuth 2.0 access token."""
+        import requests as _req
+        payload: dict = {
+            'grant_type': 'client_credentials',
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+        }
+        if self.oauth2_scope:
+            payload['scope'] = self.oauth2_scope
+        try:
+            response = _req.post(self.token_url, data=payload, timeout=30)
+            response.raise_for_status()
+        except _req.RequestException as exc:
+            raise ValueError(
+                f'OAuth 2.0 token fetch failed for endpoint "{self.endpoint.name}": {exc}'
+            ) from exc
+        token = response.json().get('access_token')
+        if not token:
+            raise ValueError(
+                f'OAuth 2.0 token response for endpoint "{self.endpoint.name}" '
+                'did not contain an access_token field.'
+            )
+        return token
 
-        Merges *extra_headers* (from ``APIEndpoint.headers``) with any
-        authentication headers / params / auth-tuple derived from the
-        stored credentials.
+    def build_request_kwargs(self, endpoint_headers: dict) -> dict:
+        """Return a dict of kwargs to pass to ``requests.request()``.
+
+        Merges *endpoint_headers* (from ``APIEndpoint.headers``) with the
+        primary authentication data, then overlays ``extra_headers`` and
+        ``extra_query_params`` so that any number of additional credential
+        parameters can be added without changing the auth type.
         """
-        headers = dict(extra_headers)
+        from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+
+        headers = dict(endpoint_headers)
         params: dict = {}
         auth = None
 
+        # -- primary authentication type ----------------------------------
         if self.auth_type == 'bearer':
             headers['Authorization'] = f'Bearer {self.token}'
         elif self.auth_type == 'api_key_header':
@@ -116,10 +194,21 @@ class APICredential(models.Model):
             if self.query_param_name:
                 params[self.query_param_name] = self.token
         elif self.auth_type == 'basic':
-            auth = (self.username, self.password)
+            auth = HTTPBasicAuth(self.username, self.password)
+        elif self.auth_type == 'digest':
+            auth = HTTPDigestAuth(self.username, self.password)
+        elif self.auth_type == 'oauth2_client_credentials':
+            access_token = self._fetch_oauth2_token()
+            headers['Authorization'] = f'Bearer {access_token}'
         elif self.auth_type == 'custom_header':
             if self.header_name:
                 headers[self.header_name] = self.token
+
+        # -- always-applied overlays (merged after primary auth) ----------
+        if self.extra_headers:
+            headers.update(self.extra_headers)
+        if self.extra_query_params:
+            params.update(self.extra_query_params)
 
         kwargs: dict = {'headers': headers}
         if params:

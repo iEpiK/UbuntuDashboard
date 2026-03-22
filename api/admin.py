@@ -16,10 +16,29 @@ class APICredentialInline(admin.StackedInline):
         ('Bearer / API Key / Custom Header', {
             'fields': ['token', 'header_name', 'query_param_name'],
             'classes': ['collapse'],
+            'description': 'Used for Bearer Token, API Key (header or query param), and Custom Header auth.',
         }),
-        ('Basic Auth', {
+        ('Basic / Digest Auth', {
             'fields': ['username', 'password'],
             'classes': ['collapse'],
+            'description': 'Used for Basic Auth and Digest Auth.',
+        }),
+        ('OAuth 2.0 – Client Credentials', {
+            'fields': ['client_id', 'client_secret', 'token_url', 'oauth2_scope'],
+            'classes': ['collapse'],
+            'description': (
+                'The dashboard will exchange client_id + client_secret for a '
+                'Bearer token at token_url before each request.'
+            ),
+        }),
+        ('Additional Headers & Query Parameters', {
+            'fields': ['extra_headers', 'extra_query_params'],
+            'classes': ['collapse'],
+            'description': (
+                'Always-applied overlays merged into every request regardless '
+                'of the primary auth type.  Use for tenant IDs, versioning '
+                'headers, secondary API keys, etc.'
+            ),
         }),
     ]
 
