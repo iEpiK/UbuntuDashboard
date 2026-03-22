@@ -1,19 +1,66 @@
 from rest_framework import serializers
 
-from .models import APIEndpoint, APIResult, ScheduledTask
+from .models import APICredential, APIEndpoint, APIResult, ScheduledTask
+
+
+class APICredentialSerializer(serializers.ModelSerializer):
+    """Credential data nested inside APIEndpointSerializer.
+
+    Sensitive fields (token, password) are write-only so they are never
+    returned in API responses.
+    """
+
+    token = serializers.CharField(
+        max_length=2000, write_only=True, required=False, allow_blank=True,
+        style={'input_type': 'password'},
+    )
+    password = serializers.CharField(
+        max_length=500, write_only=True, required=False, allow_blank=True,
+        style={'input_type': 'password'},
+    )
+
+    class Meta:
+        model = APICredential
+        fields = [
+            'auth_type',
+            'token',
+            'username',
+            'password',
+            'header_name',
+            'query_param_name',
+        ]
 
 
 class APIEndpointSerializer(serializers.ModelSerializer):
     owner = serializers.ReadOnlyField(source='owner.username')
+    credential = APICredentialSerializer(required=False)
 
     class Meta:
         model = APIEndpoint
         fields = [
             'id', 'name', 'description', 'url', 'method',
             'headers', 'body', 'is_active', 'owner',
+            'credential',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'owner', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        credential_data = validated_data.pop('credential', None)
+        endpoint = super().create(validated_data)
+        if credential_data is not None:
+            APICredential.objects.create(endpoint=endpoint, **credential_data)
+        return endpoint
+
+    def update(self, instance, validated_data):
+        credential_data = validated_data.pop('credential', None)
+        instance = super().update(instance, validated_data)
+        if credential_data is not None:
+            APICredential.objects.update_or_create(
+                endpoint=instance,
+                defaults=credential_data,
+            )
+        return instance
 
 
 class ScheduledTaskSerializer(serializers.ModelSerializer):
@@ -55,3 +102,4 @@ class APIResultSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = fields
+

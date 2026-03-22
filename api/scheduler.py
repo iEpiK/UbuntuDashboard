@@ -42,13 +42,20 @@ def _execute_endpoint(endpoint_id: int, task_id: int | None = None) -> None:
     start = time.monotonic()
     result = APIResult(endpoint=endpoint, scheduled_task=task)
 
+    # Build request kwargs, applying per-endpoint credentials if configured.
+    try:
+        cred = endpoint.credential
+        req_kwargs = cred.build_request_kwargs(endpoint.headers or {})
+    except Exception:  # noqa: BLE001 – RelatedObjectDoesNotExist or similar
+        req_kwargs = {'headers': dict(endpoint.headers or {})}
+
     try:
         response = requests.request(
             method=endpoint.method,
             url=endpoint.url,
-            headers=endpoint.headers or {},
             json=endpoint.body if endpoint.body else None,
             timeout=30,
+            **req_kwargs,
         )
         elapsed_ms = (time.monotonic() - start) * 1000
         result.status_code = response.status_code

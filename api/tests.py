@@ -6,6 +6,8 @@ Covers:
 - REST API CRUD for APIEndpoint, ScheduledTask, APIResult
 - Endpoint `run` action (mocked HTTP call)
 - Serializer validation
+- Per-endpoint APICredential model and build_request_kwargs
+- Credential nested create/update via REST API
 """
 
 from unittest.mock import MagicMock, patch
@@ -16,7 +18,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from .models import APIEndpoint, APIResult, ScheduledTask
+from .models import APICredential, APIEndpoint, APIResult, ScheduledTask
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +38,12 @@ def make_endpoint(owner, **kwargs):
     )
     defaults.update(kwargs)
     return APIEndpoint.objects.create(owner=owner, **defaults)
+
+
+def make_credential(endpoint, **kwargs):
+    defaults = dict(auth_type='bearer', token='secret-token')
+    defaults.update(kwargs)
+    return APICredential.objects.create(endpoint=endpoint, **defaults)
 
 
 def make_task(endpoint, **kwargs):
@@ -104,8 +112,68 @@ class APIResultModelTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# API endpoint CRUD tests
+# APICredential model tests
 # ---------------------------------------------------------------------------
+
+class APICredentialModelTest(TestCase):
+    def setUp(self):
+        self.user = make_user()
+        self.endpoint = make_endpoint(self.user)
+
+    def test_str(self):
+        cred = make_credential(self.endpoint)
+        self.assertIn('Test API', str(cred))
+        self.assertIn('Bearer', str(cred))
+
+    def test_build_request_kwargs_bearer(self):
+        cred = make_credential(self.endpoint, auth_type='bearer', token='tok123')
+        kwargs = cred.build_request_kwargs({})
+        self.assertEqual(kwargs['headers']['Authorization'], 'Bearer tok123')
+
+    def test_build_request_kwargs_api_key_header(self):
+        cred = make_credential(
+            self.endpoint, auth_type='api_key_header',
+            token='key123', header_name='X-API-Key',
+        )
+        kwargs = cred.build_request_kwargs({})
+        self.assertEqual(kwargs['headers']['X-API-Key'], 'key123')
+
+    def test_build_request_kwargs_api_key_query(self):
+        cred = make_credential(
+            self.endpoint, auth_type='api_key_query',
+            token='key123', query_param_name='api_key',
+        )
+        kwargs = cred.build_request_kwargs({})
+        self.assertEqual(kwargs['params']['api_key'], 'key123')
+
+    def test_build_request_kwargs_basic(self):
+        cred = make_credential(
+            self.endpoint, auth_type='basic', username='user', password='pass',
+        )
+        kwargs = cred.build_request_kwargs({})
+        self.assertEqual(kwargs['auth'], ('user', 'pass'))
+
+    def test_build_request_kwargs_custom_header(self):
+        cred = make_credential(
+            self.endpoint, auth_type='custom_header',
+            token='val', header_name='X-Custom',
+        )
+        kwargs = cred.build_request_kwargs({})
+        self.assertEqual(kwargs['headers']['X-Custom'], 'val')
+
+    def test_build_request_kwargs_none(self):
+        cred = make_credential(self.endpoint, auth_type='none', token='')
+        kwargs = cred.build_request_kwargs({'X-Existing': 'yes'})
+        self.assertEqual(kwargs['headers'].get('X-Existing'), 'yes')
+        self.assertNotIn('Authorization', kwargs['headers'])
+
+    def test_extra_headers_preserved(self):
+        cred = make_credential(self.endpoint, auth_type='bearer', token='tok')
+        kwargs = cred.build_request_kwargs({'Accept': 'application/json'})
+        self.assertEqual(kwargs['headers']['Accept'], 'application/json')
+        self.assertIn('Authorization', kwargs['headers'])
+
+
 
 class APIEndpointAPITest(TestCase):
     def setUp(self):
@@ -177,10 +245,55 @@ class APIEndpointAPITest(TestCase):
         self.assertTrue(response.data['success'])
         self.assertEqual(response.data['status_code'], 200)
 
+    def test_create_endpoint_with_credential(self):
+        data = {
+            'name': 'Secured API',
+            'url': 'https://api.example.com/secure',
+            'method': 'GET',
+            'credential': {'auth_type': 'bearer', 'token': 'mytoken'},
+        }
+        response = self.client.post(self._list_url(), data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        ep_id = response.data['id']
+        # credential is in the response but token is write-only
+        self.assertEqual(response.data['credential']['auth_type'], 'bearer')
+        self.assertNotIn('token', response.data['credential'])
+        # credential was persisted
+        ep = APIEndpoint.objects.get(pk=ep_id)
+        self.assertEqual(ep.credential.auth_type, 'bearer')
+        self.assertEqual(ep.credential.token, 'mytoken')
 
-# ---------------------------------------------------------------------------
-# ScheduledTask API tests
-# ---------------------------------------------------------------------------
+    def test_update_credential_via_patch(self):
+        ep = make_endpoint(self.user)
+        make_credential(ep, auth_type='bearer', token='old-token')
+        response = self.client.patch(
+            self._detail_url(ep.pk),
+            {'credential': {'auth_type': 'api_key_header', 'token': 'new-key', 'header_name': 'X-Api-Key'}},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ep.refresh_from_db()
+        self.assertEqual(ep.credential.auth_type, 'api_key_header')
+        self.assertEqual(ep.credential.token, 'new-key')
+
+    @patch('api.views.requests.request')
+    def test_run_action_applies_bearer_credentials(self, mock_request):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = 'ok'
+        mock_resp.headers = {}
+        mock_resp.ok = True
+        mock_request.return_value = mock_resp
+
+        ep = make_endpoint(self.user)
+        make_credential(ep, auth_type='bearer', token='my-bearer')
+        url = reverse('apiendpoint-run', args=[ep.pk])
+        self.client.post(url)
+        call_kwargs = mock_request.call_args
+        headers = call_kwargs.kwargs.get('headers', call_kwargs[1].get('headers', {}))
+        self.assertEqual(headers.get('Authorization'), 'Bearer my-bearer')
+
+
 
 class ScheduledTaskAPITest(TestCase):
     def setUp(self):
